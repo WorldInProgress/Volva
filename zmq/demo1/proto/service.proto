@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package proto;
+option go_package = "zmq/demo1/proto";
+
+service MessageService {
+  rpc SendMessage (Message) returns (Response) {}
+}
+
+message Message {
+  string content = 1;
+}
+
+message Response {
+  string result = 1;
+}
