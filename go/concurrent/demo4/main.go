@@ -178,7 +178,7 @@ type WorkerPool struct {
 }
 
 // 中间件函数类型
-type MiddlewareFunc func(Task) Task
+type MiddlewareFunc func(wp *WorkerPool, next Task) Task
 
 // 错误处理器接口
 type ErrorHandler interface {
@@ -363,7 +363,7 @@ func (wp *WorkerPool) startHTTPServer() {
 }
 
 // 任务处理中间件示例
-func withLogging(next Task) Task {
+func withLogging(wp *WorkerPool, next Task) Task {
     return &middlewareTask{
         Task: next,
         execute: func(ctx context.Context) (interface{}, error) {
@@ -469,45 +469,6 @@ func (wp *WorkerPool) Start() {
     // 启动指标收集
     if wp.config.Monitoring.Enabled {
         go wp.collectMetrics()
-    }
-}
-
-// 主函数
-func main() {
-    // 加载配置
-    config, err := loadConfig(defaultConfigPath)
-    if err != nil {
-        log.Fatalf("Failed to load configuration: %v", err)
-    }
-
-    // 创建工作池
-    pool, err := NewWorkerPool(config)
-    if err != nil {
-        log.Fatalf("Failed to create worker pool: %v", err)
-    }
-
-    // 添加中间件
-    pool.Use(withLogging)
-    // pool.Use(withMetrics)  // 暂时注释掉
-    // pool.Use(withTracing)  // 暂时注释掉
-
-    // 启动工作池
-    pool.Start()
-
-    // 启动 HTTP 服务器
-    pool.startHTTPServer()
-
-    // 等待中断信号
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, os.Interrupt)
-    <-sigChan
-
-    // 优雅关闭
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    
-    if err := pool.Shutdown(ctx); err != nil {
-        log.Printf("Shutdown error: %v", err)
     }
 }
 
@@ -645,5 +606,85 @@ func (w *Worker) start() {
         w.pool.metrics.mu.Lock()
         w.pool.metrics.taskLatencies = append(w.pool.metrics.taskLatencies, duration)
         w.pool.metrics.mu.Unlock()
+    }
+}
+
+// 指标中间件
+func withMetrics(wp *WorkerPool, next Task) Task {
+    return &middlewareTask{
+        Task: next,
+        execute: func(ctx context.Context) (interface{}, error) {
+            start := time.Now()
+            result, err := next.Execute(ctx)
+            duration := time.Since(start)
+            
+            // 现在可以访问工作池的指标
+            if err != nil {
+                wp.metrics.tasksFailed.Inc()
+            } else {
+                wp.metrics.tasksSucceeded.Inc()
+            }
+            wp.metrics.tasksDuration.Observe(duration.Seconds())
+            
+            return result, err
+        },
+    }
+}
+
+// 修改追踪中间件
+func withTracing(wp *WorkerPool, next Task) Task {
+    return &middlewareTask{
+        Task: next,
+        execute: func(ctx context.Context) (interface{}, error) {
+            // 使用工作池的追踪器
+            tracer := wp.tracer
+            if tracer == nil {
+                return next.Execute(ctx)
+            }
+
+            spanCtx, span := tracer.Start(ctx, fmt.Sprintf("task-%s", next.GetID()))
+            defer span.End()
+
+            return next.Execute(spanCtx)
+        },
+    }
+}
+
+// 主函数
+func main() {
+    // 加载配置
+    config, err := loadConfig(defaultConfigPath)
+    if err != nil {
+        log.Fatalf("Failed to load configuration: %v", err)
+    }
+
+    // 创建工作池
+    pool, err := NewWorkerPool(config)
+    if err != nil {
+        log.Fatalf("Failed to create worker pool: %v", err)
+    }
+
+    // 添加中间件
+    pool.Use(withLogging)
+    pool.Use(withMetrics)
+    pool.Use(withTracing)
+
+    // 启动工作池
+    pool.Start()
+
+    // 启动 HTTP 服务器
+    pool.startHTTPServer()
+
+    // 等待中断信号
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt)
+    <-sigChan
+
+    // 优雅关闭
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    
+    if err := pool.Shutdown(ctx); err != nil {
+        log.Printf("Shutdown error: %v", err)
     }
 }

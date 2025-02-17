@@ -92,6 +92,7 @@ type WorkerPool struct {
     errorHandler func(error)
     mu           sync.RWMutex
     workers      map[int]*Worker
+    quit         chan struct{}
 }
 
 // 指标收集器，定义了任务处理总数、失败数、成功数、处理时间、任务延迟
@@ -127,12 +128,13 @@ func NewWorkerPool(config WorkerPoolConfig) *WorkerPool {
         cancel:       cancel,
         workers:      make(map[int]*Worker),
         errorHandler: defaultErrorHandler,
+        quit:         make(chan struct{}),
     }
 
     return wp
 }
 
-// 启动工作池，启动工作者、启动指标收集、启动信号处理
+// 启动工作池，启动工作者、启动指标收集
 func (wp *WorkerPool) Start() {
     // 启动工作者
     for i := 0; i < wp.config.NumWorkers; i++ {
@@ -148,13 +150,13 @@ func (wp *WorkerPool) Start() {
         go worker.start()
     }
 
+    // 启动信号处理
+    go wp.handleSignals()
+
     // 启动指标收集
     if wp.config.MetricsEnabled {
         go wp.collectMetrics()
     }
-
-    // 启动信号处理
-    go wp.handleSignals()
 }
 
 // 工作者处理逻辑，启动工作者、处理任务、更新指标、发送结果
@@ -224,6 +226,11 @@ func (w *Worker) processTask(task Task) TaskResult {
 
     result.EndTime = time.Now()
     log.Printf("Worker %d completed task %s", w.ID, task.GetID())
+
+    // 计算并记录任务延迟
+    taskDuration := time.Since(startTime)
+    w.pool.recordTaskLatency(taskDuration)
+    
     return result
 }
 
@@ -248,17 +255,16 @@ func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
     wp.cancel()
 
     // 创建关闭通道
-    done := make(chan struct{})
     go func() {
         wp.wg.Wait()
-        close(done)
+        close(wp.quit)
     }()
 
     // 等待超时或完成
     select {
     case <-time.After(timeout):
         return errors.New("shutdown timeout")
-    case <-done:
+    case <-wp.quit:
         return nil
     }
 }
@@ -273,37 +279,28 @@ func (wp *WorkerPool) collectMetrics() {
         case <-wp.ctx.Done():
             return
         case <-ticker.C:
-            wp.metrics.mu.Lock()
             total := atomic.LoadUint64(&wp.metrics.TasksProcessed)
             failed := atomic.LoadUint64(&wp.metrics.TasksFailed)
             succeeded := atomic.LoadUint64(&wp.metrics.TasksSucceeded)
             
-            // 计算平均延迟
-            var avgLatency time.Duration
-            if len(wp.metrics.taskLatencies) > 0 {
-                var sum time.Duration
-                for _, lat := range wp.metrics.taskLatencies {
-                    sum += lat
-                }
-                avgLatency = sum / time.Duration(len(wp.metrics.taskLatencies))
-            }
+            min, max, avg := wp.getLatencyStats()  // 使用统计函数
             
-            log.Printf("Metrics - Total: %d, Succeeded: %d, Failed: %d, Avg Latency: %v",
-                total, succeeded, failed, avgLatency)
-            
-            wp.metrics.mu.Unlock()
+            log.Printf("Metrics - Total: %d, Succeeded: %d, Failed: %d, Latency(min/avg/max): %v/%v/%v",
+                total, succeeded, failed, min, avg, max)
         }
     }
 }
 
-// 信号处理，创建信号通道、通知信号通道、等待信号、关闭工作池
 func (wp *WorkerPool) handleSignals() {
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, os.Interrupt)
-
+    
     <-sigChan
     log.Println("Received shutdown signal, initiating graceful shutdown...")
-    wp.Shutdown(30 * time.Second)
+    
+    if err := wp.Shutdown(30 * time.Second); err != nil {
+        log.Printf("Shutdown error: %v", err)
+    }
 }
 
 // 默认错误处理，记录错误
@@ -332,13 +329,57 @@ func (t *ExampleTask) GetPriority() Priority {
     return t.Priority
 }
 
+// 添加新方法来记录任务延迟
+func (wp *WorkerPool) recordTaskLatency(duration time.Duration) {
+    wp.metrics.mu.Lock()
+    defer wp.metrics.mu.Unlock()
+    
+    // 保持最近 N 个任务的延迟记录
+    const maxLatencyRecords = 1000
+    
+    wp.metrics.taskLatencies = append(wp.metrics.taskLatencies, duration)
+    
+    // 如果记录太多，删除最旧的记录
+    if len(wp.metrics.taskLatencies) > maxLatencyRecords {
+        // 保留最后 maxLatencyRecords 个记录
+        wp.metrics.taskLatencies = wp.metrics.taskLatencies[len(wp.metrics.taskLatencies)-maxLatencyRecords:]
+    }
+}
+
+// 添加方法获取延迟统计信息
+func (wp *WorkerPool) getLatencyStats() (min, max, avg time.Duration) {
+    wp.metrics.mu.RLock()
+    defer wp.metrics.mu.RUnlock()
+    
+    if len(wp.metrics.taskLatencies) == 0 {
+        return 0, 0, 0
+    }
+    
+    min = wp.metrics.taskLatencies[0]
+    max = wp.metrics.taskLatencies[0]
+    var sum time.Duration
+    
+    for _, lat := range wp.metrics.taskLatencies {
+        sum += lat
+        if lat < min {
+            min = lat
+        }
+        if lat > max {
+            max = lat
+        }
+    }
+    
+    avg = sum / time.Duration(len(wp.metrics.taskLatencies))
+    return min, max, avg
+}
+
 // 主函数
 func main() {
     // 配置工作池
     config := WorkerPoolConfig{
         NumWorkers:     5,
         QueueSize:      100,
-        RateLimit:      10.0, // 每秒处理10个任务
+        RateLimit:      10.0,
         MaxRetries:     3,
         TaskTimeout:    5 * time.Second,
         RetryInterval:  time.Second,
@@ -358,7 +399,6 @@ func main() {
                 Created:  time.Now(),
             },
             ProcessingFunc: func(ctx context.Context) (interface{}, error) {
-                // 模拟任务处理
                 time.Sleep(time.Duration(500+i*100) * time.Millisecond)
                 return fmt.Sprintf("Result of task-%d", i), nil
             },
@@ -372,5 +412,6 @@ func main() {
     }
 
     // 等待信号处理程序处理关闭
-    select {}
+    <-pool.quit
+    log.Println("Program exit")
 }
